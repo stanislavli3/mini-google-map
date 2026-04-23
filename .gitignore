@@ -1,0 +1,89 @@
+# =========================================
+# Python
+# =========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# =========================================
+# Jupyter / IPython
+# =========================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# =========================================
+# macOS
+# =========================================
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+
+# =========================================
+# IDE / editors
+# =========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# =========================================
+# This project — DATA
+# =========================================
+# Trajectories are huge (hundreds of MB) and not ours to redistribute
+Trajectories/
+T-SF-processed/
+Test Cases/
+*.graphml
+
+# Stage outputs — these are regenerable from the scripts
+complete_speeds.pkl
+complete_speeds.*.pkl
+observed_speeds.pkl
+observed_speeds.*.pkl
+vehicle_features.pkl
+*.partial.pkl
+
+# Kaggle test file (may be under a competition license)
+kaggle-test-file-minute.csv
+
+# Generated submissions — keep the code that makes them, not the files
+submission*.csv
+
+# Map matching / visualization outputs
+map_matching_result.html
+traffic_speed_map.html
+*.html
+
+# =========================================
+# This project — RUN LOGS
+# =========================================
+test_cases.log
+stage2.log
+*.log
+nohup.out
+
+# CatBoost training artifacts (regenerable)
+catboost_info/
+
+# =========================================
+# Secrets (paranoia — shouldn't exist here but just in case)
+# =========================================
+.env
+*.key
+credentials.json
