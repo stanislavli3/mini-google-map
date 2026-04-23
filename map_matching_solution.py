@@ -429,9 +429,13 @@ def visualize_matching(
     gps_coords = [[p.lat, p.lon] for p in trajectory]
     folium.PolyLine(gps_coords, color="red", weight=2, dash_array="5").add_to(m)
 
-    # Matched points (blue)
+    # Matched points (blue). Entries may be None (path breaks / dropped
+    # points from the fast matcher) — skip those.
     matched_coords = []
-    for edge_id, (plat, plon) in matched:
+    for entry in matched:
+        if entry is None:
+            continue
+        edge_id, (plat, plon) = entry
         matched_coords.append([plat, plon])
         folium.CircleMarker(
             location=[plat, plon],
@@ -447,7 +451,7 @@ def visualize_matching(
         folium.PolyLine(matched_coords, color="blue", weight=3).add_to(m)
 
     # Highlight matched road segments (green)
-    matched_edge_ids = set(edge_id for edge_id, _ in matched)
+    matched_edge_ids = {entry[0] for entry in matched if entry is not None}
     for eid in matched_edge_ids:
         u, v, key = eid
         row = edges_gdf[

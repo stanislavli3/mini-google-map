@@ -51,7 +51,10 @@ from map_matching_solution import (
     great_circle_distance,
 )
 # Use the fast matcher we wrote earlier.
-from map_matching_fast import hmm_map_match_fast as hmm_map_match
+from map_matching_fast import (
+    hmm_map_match_fast as hmm_map_match,
+    iter_matched_pairs,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -79,20 +82,20 @@ def timestamp_to_time_bin(ts, interval=TIME_INTERVAL):
 # Part 1: map-match + merge into Stage 2 dict
 # ---------------------------------------------------------------------------
 def compute_segment_speeds(trajectory, matched):
+    """Aggregate observed speeds. Skips pairs where either matched entry is
+    None (dropped in preprocessing or past a path break)."""
     segment_speeds = defaultdict(list)
-    n_pairs = min(len(trajectory), len(matched)) - 1
-    for i in range(n_pairs):
-        t_i = trajectory[i].timestamp
-        t_next = trajectory[i + 1].timestamp
-        edge_i, (lat_i, lon_i) = matched[i]
-        edge_next, (lat_next, lon_next) = matched[i + 1]
+    for pt_i, pt_next, match_i, match_next in iter_matched_pairs(trajectory, matched):
+        t_i = pt_i.timestamp
+        t_next = pt_next.timestamp
+        edge_i, (lat_i, lon_i) = match_i
+        edge_next, (lat_next, lon_next) = match_next
 
         avg_ts = (t_i + t_next) // 2
         time_bin = timestamp_to_time_bin(avg_ts)
 
         distance = great_circle_distance(lat_i, lon_i, lat_next, lon_next)
         time_delta = abs(t_next - t_i)
-
         if time_delta == 0 or distance == 0:
             continue
 
@@ -100,11 +103,12 @@ def compute_segment_speeds(trajectory, matched):
         if speed > MAX_REASONABLE_SPEED:
             continue
 
-        if edge_i == edge_next:
-            segment_speeds[(edge_i, time_bin)].append(speed)
-        else:
-            segment_speeds[(edge_i, time_bin)].append(speed)
-            segment_speeds[(edge_next, time_bin)].append(speed)
+        # Confidence weighting: occupied (flag=1) pairs are more reliable
+        # because the cab has a passenger and a destination. Weight 2x.
+        weight = 2 if (pt_i.flag == 1 and pt_next.flag == 1) else 1
+        edges_touched = [edge_i] if edge_i == edge_next else [edge_i, edge_next]
+        for e in edges_touched:
+            segment_speeds[(e, time_bin)].extend([speed] * weight)
 
     return dict(segment_speeds)
 
@@ -234,21 +238,17 @@ def compute_vehicle_features(per_vehicle_matched, edges_gdf):
     features = {}
 
     for vehicle_id, (traj, matched) in per_vehicle_matched.items():
-        n_pairs = min(len(traj), len(matched)) - 1
-        if n_pairs < 2:
-            continue
-
         speeds = []
         total_dist = 0.0
         hwy_count = 0
         total_matches = 0
         hours = Counter()
 
-        for i in range(n_pairs):
-            t_i = traj[i].timestamp
-            t_next = traj[i + 1].timestamp
-            _, (lat_i, lon_i) = matched[i]
-            edge_next, (lat_next, lon_next) = matched[i + 1]
+        for pt_i, pt_next, _match_i, match_next in iter_matched_pairs(traj, matched):
+            t_i = pt_i.timestamp
+            t_next = pt_next.timestamp
+            _, (lat_i, lon_i) = _match_i
+            edge_next, (lat_next, lon_next) = match_next
 
             d = great_circle_distance(lat_i, lon_i, lat_next, lon_next)
             dt = abs(t_next - t_i)
@@ -266,6 +266,9 @@ def compute_vehicle_features(per_vehicle_matched, edges_gdf):
 
             hour = datetime.fromtimestamp(t_i, tz=timezone.utc).hour
             hours[hour] += 1
+
+        if total_matches < 2:
+            continue
 
         # Trip durations via flag-based segmentation
         trip_durations = []

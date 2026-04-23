@@ -31,6 +31,7 @@ import pandas as pd
 import networkx as nx
 import geopandas as gpd
 from scipy.spatial import cKDTree
+from sklearn.model_selection import KFold
 
 # Your existing modules
 from map_matching_solution import (
@@ -40,6 +41,7 @@ from map_matching_solution import (
     great_circle_distance,
     hmm_map_match,
 )
+from weather_features import load_sf_weather, floor_to_hour_utc
 
 warnings.filterwarnings("ignore")
 
@@ -472,8 +474,29 @@ def add_cluster_features(
     return df, kmeans_src, kmeans_dst
 
 
+ROAD_CLASS_BUCKETS = {
+    "motorway": "motorway", "motorway_link": "motorway",
+    "trunk": "trunk", "trunk_link": "trunk",
+    "primary": "primary", "primary_link": "primary",
+    "secondary": "secondary", "secondary_link": "secondary",
+    "tertiary": "other", "tertiary_link": "other",
+    "residential": "residential", "living_street": "residential",
+    "service": "other", "unclassified": "other",
+}
+
+
 def add_physics_features(df: pd.DataFrame, physics: PhysicsETA) -> pd.DataFrame:
-    """Route every row using batched scipy Dijkstra (C-compiled, ~100x faster than NX)."""
+    """
+    Route every row using batched scipy Dijkstra (C-compiled, ~100x faster than NX).
+    We capture predecessors so we can reconstruct the shortest path per row and
+    derive:
+      - route_n_edges (no longer stubbed to 0)
+      - route_n_turns (bearing-change count)
+      - route_pct_{motorway,trunk,primary,secondary,residential,other}
+      - a rolling-time-bin ETA that re-bins as we walk the path (for trips
+        that cross 30-min boundaries). The original start-time-snapshot ETA
+        is retained as physics_eta_snapshot_min so CatBoost can pick either.
+    """
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import dijkstra as sp_dijkstra
 
@@ -481,19 +504,27 @@ def add_physics_features(df: pd.DataFrame, physics: PhysicsETA) -> pd.DataFrame:
     n = len(physics.node_list)
     node_to_idx = physics._node_to_idx
 
-    # Vectorized nearest-node lookup for all rows at once
     src_idxs = physics._node_tree.query(df[["source_lat", "source_lon"]].values)[1]
     dst_idxs = physics._node_tree.query(df[["dest_lat", "dest_lon"]].values)[1]
 
     tbins = df["source_time"].apply(lambda ts: timestamp_to_time_bin(int(ts)))
+    start_ts_arr = df["source_time"].astype("int64").values
 
-    etas = np.zeros(len(df))
+    etas_snapshot = np.zeros(len(df))
+    etas_rolling = np.zeros(len(df))
     lens = np.zeros(len(df))
+    n_edges_arr = np.zeros(len(df), dtype=np.int32)
+    n_turns_arr = np.zeros(len(df), dtype=np.int32)
+    pct_motorway = np.zeros(len(df))
+    pct_trunk = np.zeros(len(df))
+    pct_primary = np.zeros(len(df))
+    pct_secondary = np.zeros(len(df))
+    pct_residential = np.zeros(len(df))
+    pct_other = np.zeros(len(df))
 
     for tbin in tbins.unique():
         mask_positions = np.where((tbins == tbin).values)[0]
 
-        # Build sparse travel-time and distance matrices (cached per tbin)
         weights = physics._get_edge_weights(tbin)
         rows_g, cols_g, t_data, d_data = [], [], [], []
         for (u, v, key), tt in weights.items():
@@ -511,49 +542,182 @@ def add_physics_features(df: pd.DataFrame, physics: PhysicsETA) -> pd.DataFrame:
         T_mat = csr_matrix((t_data, (rows_g, cols_g)), shape=(n, n))
         D_mat = csr_matrix((d_data, (rows_g, cols_g)), shape=(n, n))
 
-        # One scipy Dijkstra per unique source node — covers all destinations for free
         unique_srcs = np.unique(src_idxs[mask_positions])
-        t_dists = sp_dijkstra(T_mat, indices=unique_srcs, directed=True)
+        t_dists, t_preds = sp_dijkstra(
+            T_mat, indices=unique_srcs, directed=True, return_predecessors=True
+        )
         d_dists = sp_dijkstra(D_mat, indices=unique_srcs, directed=True)
         src_row = {int(s): i for i, s in enumerate(unique_srcs)}
 
         for pos in mask_positions:
             si, di = int(src_idxs[pos]), int(dst_idxs[pos])
             r = src_row[si]
-            total_t = t_dists[r, di]
+            snap_t = t_dists[r, di]
             total_d = d_dists[r, di]
-            if np.isinf(total_t):
+
+            if np.isinf(snap_t):
                 row = df.iloc[pos]
                 d = great_circle_distance(
                     row.source_lat, row.source_lon,
                     row.dest_lat, row.dest_lon,
                 )
-                total_t, total_d = d / DEFAULT_SPEED_MS, d
-            etas[pos] = total_t / 60.0
-            lens[pos] = total_d
+                snap_t, total_d = d / DEFAULT_SPEED_MS, d
+                etas_snapshot[pos] = snap_t / 60.0
+                etas_rolling[pos] = snap_t / 60.0
+                lens[pos] = total_d
+                pct_other[pos] = 1.0
+                continue
 
-    df["physics_eta_min"] = etas
+            # Reconstruct path: walk predecessors from dst back to src
+            path_nodes = [di]
+            cur = di
+            guard = 0
+            while cur != si and guard < 20000:
+                prev = int(t_preds[r, cur])
+                if prev < 0:
+                    break
+                path_nodes.append(prev)
+                cur = prev
+                guard += 1
+            path_nodes.reverse()
+
+            start_ts = int(start_ts_arr[pos])
+            running_s = 0.0
+            cur_tbin = tbin
+            cur_weights = weights
+
+            bucket_counts = {"motorway": 0, "trunk": 0, "primary": 0,
+                             "secondary": 0, "residential": 0, "other": 0}
+            n_turns = 0
+            last_bearing = None
+            n_edges = 0
+
+            for i in range(len(path_nodes) - 1):
+                u_idx, v_idx = path_nodes[i], path_nodes[i + 1]
+                u_node = physics.node_list[u_idx]
+                v_node = physics.node_list[v_idx]
+                edges_uv = physics.G.get_edge_data(u_node, v_node)
+                if not edges_uv:
+                    continue
+                key = min(edges_uv.keys(),
+                          key=lambda k: edges_uv[k].get("length", 1e9))
+                edge_id = (u_node, v_node, key)
+
+                # Rolling bin: re-bucket when we cross a 30-min boundary
+                new_tbin = timestamp_to_time_bin(start_ts + int(running_s))
+                if new_tbin != cur_tbin:
+                    cur_tbin = new_tbin
+                    cur_weights = physics._get_edge_weights(cur_tbin)
+                tt = cur_weights.get(edge_id)
+                if tt is None or tt <= 0:
+                    tt = physics.edge_travel_time_s(edge_id, cur_tbin)
+                running_s += tt
+
+                rt = physics._edge_rtype.get(edge_id, "unclassified")
+                bucket_counts[ROAD_CLASS_BUCKETS.get(rt, "other")] += 1
+
+                u_lat, u_lon = physics.node_coords[u_idx]
+                v_lat, v_lon = physics.node_coords[v_idx]
+                br = bearing_deg(u_lat, u_lon, v_lat, v_lon)
+                if last_bearing is not None:
+                    delta = abs(br - last_bearing)
+                    if delta > 180:
+                        delta = 360 - delta
+                    if delta > 30:
+                        n_turns += 1
+                last_bearing = br
+                n_edges += 1
+
+            etas_snapshot[pos] = snap_t / 60.0
+            etas_rolling[pos] = (running_s / 60.0) if n_edges > 0 else snap_t / 60.0
+            lens[pos] = total_d
+            n_edges_arr[pos] = n_edges
+            n_turns_arr[pos] = n_turns
+            if n_edges > 0:
+                pct_motorway[pos] = bucket_counts["motorway"] / n_edges
+                pct_trunk[pos] = bucket_counts["trunk"] / n_edges
+                pct_primary[pos] = bucket_counts["primary"] / n_edges
+                pct_secondary[pos] = bucket_counts["secondary"] / n_edges
+                pct_residential[pos] = bucket_counts["residential"] / n_edges
+                pct_other[pos] = bucket_counts["other"] / n_edges
+
+    df["physics_eta_min"] = etas_rolling
+    df["physics_eta_snapshot_min"] = etas_snapshot
     df["route_length_km"] = lens / 1000.0
-    # route_n_edges not reconstructed from scipy predecessors; set to 0 (constant, CatBoost ignores)
-    df["route_n_edges"] = 0
+    df["route_n_edges"] = n_edges_arr
+    df["route_n_turns"] = n_turns_arr
+    df["route_pct_motorway"] = pct_motorway
+    df["route_pct_trunk"] = pct_trunk
+    df["route_pct_primary"] = pct_primary
+    df["route_pct_secondary"] = pct_secondary
+    df["route_pct_residential"] = pct_residential
+    df["route_pct_other"] = pct_other
     df["route_detour_ratio"] = df["route_length_km"] / df["haversine_km"].clip(lower=0.01)
     return df
 
 
+def _oof_target_encode(df: pd.DataFrame, n_folds: int = 5) -> pd.DataFrame:
+    """
+    Out-of-fold target encoding for hist_duration_* on the training set.
+    Each row's encoded value is computed from rows in the other folds only,
+    so the label never appears in its own feature.
+    """
+    df = df.reset_index(drop=True).copy()
+    n = len(df)
+    hist_min = np.full(n, np.nan)
+    hist_od = np.full(n, np.nan)
+    hist_hour = np.full(n, np.nan)
+
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+    for train_pos, val_pos in kf.split(df):
+        base = df.iloc[train_pos]
+        fold = df.iloc[val_pos]
+
+        agg = base.groupby(["src_cluster", "dst_cluster", "hour"])["duration_min"].median()
+        agg2 = base.groupby(["src_cluster", "dst_cluster"])["duration_min"].median()
+        agg3 = base.groupby(["hour"])["duration_min"].median()
+
+        keys1 = list(zip(fold["src_cluster"], fold["dst_cluster"], fold["hour"]))
+        keys2 = list(zip(fold["src_cluster"], fold["dst_cluster"]))
+        keys3 = list(fold["hour"])
+
+        hist_min[val_pos] = [agg.get(k, np.nan) for k in keys1]
+        hist_od[val_pos] = [agg2.get(k, np.nan) for k in keys2]
+        hist_hour[val_pos] = [agg3.get(k, np.nan) for k in keys3]
+
+    global_median = float(df["duration_min"].median())
+    hist_min = np.where(np.isnan(hist_min), hist_od, hist_min)
+    hist_min = np.where(np.isnan(hist_min), hist_hour, hist_min)
+    hist_min = np.where(np.isnan(hist_min), global_median, hist_min)
+    hist_od = np.where(np.isnan(hist_od), hist_hour, hist_od)
+    hist_od = np.where(np.isnan(hist_od), global_median, hist_od)
+    hist_hour = np.where(np.isnan(hist_hour), global_median, hist_hour)
+
+    df["hist_duration_min"] = hist_min
+    df["hist_duration_od"] = hist_od
+    df["hist_duration_hour"] = hist_hour
+    return df
+
+
 def add_historical_features(
-    df: pd.DataFrame, train_df: Optional[pd.DataFrame] = None
+    df: pd.DataFrame,
+    train_df: Optional[pd.DataFrame] = None,
+    n_folds: int = 5,
 ) -> pd.DataFrame:
     """
-    For each (src_cluster, dst_cluster, hour) bucket in `train_df`, store
-    the median duration. Then look up that value as a feature. If
-    train_df is None, compute from df itself (for training) but use
-    leave-one-out to avoid leakage.
+    Historical target-encoded duration features.
 
-    For simplicity here, we compute on all of train_df. If you want to be
-    strict, swap for a k-fold target encoding.
+    - If `train_df` is None, we're encoding the training set itself, so we
+      use out-of-fold means (KFold with n_folds). No row sees its own label.
+    - If `train_df` is provided, we're encoding val/test, so we just look
+      up medians from the full training set (clean — none of these rows
+      were used to compute those medians).
     """
+    if train_df is None:
+        return _oof_target_encode(df, n_folds=n_folds)
+
     df = df.copy()
-    base = train_df if train_df is not None else df
+    base = train_df
 
     agg = (
         base.groupby(["src_cluster", "dst_cluster", "hour"])["duration_min"]
@@ -563,7 +727,6 @@ def add_historical_features(
     )
     df = df.merge(agg, on=["src_cluster", "dst_cluster", "hour"], how="left")
 
-    # Broader fallbacks for unseen OD+hour combos
     agg2 = (
         base.groupby(["src_cluster", "dst_cluster"])["duration_min"]
         .median()
@@ -580,12 +743,107 @@ def add_historical_features(
     )
     df = df.merge(agg3, on=["hour"], how="left")
 
+    global_median = float(base["duration_min"].median())
     df["hist_duration_min"] = (
         df["hist_duration_min"]
         .fillna(df["hist_duration_od"])
         .fillna(df["hist_duration_hour"])
-        .fillna(base["duration_min"].median())
+        .fillna(global_median)
     )
+    df["hist_duration_od"] = (
+        df["hist_duration_od"].fillna(df["hist_duration_hour"]).fillna(global_median)
+    )
+    df["hist_duration_hour"] = df["hist_duration_hour"].fillna(global_median)
+    return df
+
+
+VEHICLE_FEATURE_COLS = [
+    "v_mean_speed_ms", "v_median_speed_ms", "v_p20_speed_ms", "v_p80_speed_ms",
+    "v_total_km", "v_n_points", "v_hour_dominant", "v_hour_entropy",
+    "v_pct_highway", "v_typical_trip_min", "v_n_trips",
+]
+
+
+def add_vehicle_features(
+    df: pd.DataFrame,
+    vehicle_features: Dict,
+    fallback_medians: Optional[Dict[str, float]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    Merge per-vehicle historical aggregates computed by
+    process_test_cases.compute_vehicle_features.
+
+    Keys in `vehicle_features` include the `.txt` suffix (filename-based);
+    df["vehicle_id"] is the stem. We normalize both to the stem form before
+    joining. Unseen vehicles get column-wise medians — passing a
+    `fallback_medians` dict ensures train/val/test use the same fill values.
+    Returns (df, medians_dict) so the caller can reuse medians across splits.
+    """
+    df = df.copy()
+    normalized = {
+        (k[:-4] if isinstance(k, str) and k.endswith(".txt") else k): v
+        for k, v in vehicle_features.items()
+    }
+    if normalized:
+        vf_df = pd.DataFrame.from_dict(normalized, orient="index").reset_index()
+        vf_df = vf_df.rename(columns={"index": "_vid_stem"})
+    else:
+        vf_df = pd.DataFrame(columns=["_vid_stem"] + VEHICLE_FEATURE_COLS)
+
+    for c in VEHICLE_FEATURE_COLS:
+        if c not in vf_df.columns:
+            vf_df[c] = np.nan
+
+    df["_vid_stem"] = (
+        df["vehicle_id"].astype(str).str.replace(".txt", "", regex=False)
+    )
+    df = df.merge(
+        vf_df[["_vid_stem"] + VEHICLE_FEATURE_COLS], on="_vid_stem", how="left"
+    )
+    df = df.drop(columns=["_vid_stem"])
+
+    medians = fallback_medians or {}
+    for c in VEHICLE_FEATURE_COLS:
+        if c in medians:
+            fill_val = medians[c]
+        else:
+            series = vf_df[c].dropna()
+            if len(series) == 0:
+                fill_val = 12 if c == "v_hour_dominant" else 0.0
+            else:
+                fill_val = (
+                    int(series.median()) if c == "v_hour_dominant"
+                    else float(series.median())
+                )
+            medians[c] = fill_val
+        df[c] = df[c].fillna(fill_val)
+
+    return df, medians
+
+
+def add_weather_features(
+    df: pd.DataFrame, weather_df: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Join hourly SF weather onto each row by flooring source_time to the hour.
+    `weather_df` is the output of weather_features.load_sf_weather.
+    """
+    df = df.copy()
+    df["_hour_ts"] = df["source_time"].apply(
+        lambda ts: floor_to_hour_utc(int(ts))
+    )
+    w = weather_df.rename(columns={"timestamp_hour": "_hour_ts"})
+    df = df.merge(
+        w[["_hour_ts", "temp_c", "precip_mm", "wind_kph", "condition"]],
+        on="_hour_ts", how="left",
+    )
+    df = df.drop(columns=["_hour_ts"])
+
+    for c in ("temp_c", "wind_kph", "precip_mm"):
+        med = float(weather_df[c].median()) if not weather_df[c].isna().all() else 0.0
+        df[c] = df[c].fillna(med)
+    df["condition"] = df["condition"].fillna("0").astype(str)
+    df["weather_is_rain"] = (df["precip_mm"] > 0.1).astype(int)
     return df
 
 
@@ -597,12 +855,20 @@ FEATURE_COLS = [
     "hour", "minute_of_day", "day_of_week", "is_weekend",
     "hour_sin", "hour_cos",
     "src_cluster", "dst_cluster", "od_pair",
-    "physics_eta_min", "route_length_km", "route_n_edges", "route_detour_ratio",
+    "physics_eta_min", "physics_eta_snapshot_min",
+    "route_length_km", "route_n_edges", "route_n_turns", "route_detour_ratio",
+    "route_pct_motorway", "route_pct_trunk", "route_pct_primary",
+    "route_pct_secondary", "route_pct_residential", "route_pct_other",
     "hist_duration_min", "hist_duration_od", "hist_duration_hour",
     "vehicle_id",
+    "v_mean_speed_ms", "v_median_speed_ms", "v_p20_speed_ms", "v_p80_speed_ms",
+    "v_total_km", "v_n_points", "v_hour_dominant", "v_hour_entropy",
+    "v_pct_highway", "v_typical_trip_min", "v_n_trips",
+    "temp_c", "precip_mm", "wind_kph", "weather_is_rain", "condition",
 ]
 CAT_COLS = ["src_cluster", "dst_cluster", "od_pair", "vehicle_id",
-            "hour", "day_of_week", "is_weekend"]
+            "hour", "day_of_week", "is_weekend",
+            "v_hour_dominant", "condition"]
 
 
 def train_catboost(
@@ -651,6 +917,80 @@ def train_catboost(
     return model
 
 
+def apply_sanity_fallback(pred_min, df: pd.DataFrame) -> np.ndarray:
+    """
+    Protect against model blow-outs by enforcing distance-based bounds and
+    blending wildly off predictions toward the physics ETA.
+
+    - Hard floor: route_length at 40 m/s (~144 km/h, absolute ceiling speed)
+    - Hard ceiling: route_length at 2.5 m/s (~9 km/h, gridlock crawl)
+    - Soft blend toward physics_eta when |pred / physics| is outside [1/3, 3]
+
+    The physics ETA is conservative — higher RMSE than the model on average
+    — but never absurd, which makes it the right fallback for tail cases.
+    """
+    pred = np.asarray(pred_min, dtype=float).copy()
+    physics = df["physics_eta_min"].values
+    route_km = np.asarray(df["route_length_km"].values, dtype=float)
+    haversine = np.asarray(df["haversine_km"].values, dtype=float)
+
+    # Use max(route, haversine) so a broken physics route (route_km ≈ 0)
+    # doesn't floor the prediction at 0 minutes.
+    length_km = np.maximum(route_km, haversine).clip(min=0.05)
+    t_floor = length_km * 1000.0 / 40.0 / 60.0
+    t_ceil = length_km * 1000.0 / 2.5 / 60.0
+    pred = np.clip(pred, t_floor, t_ceil)
+
+    safe_physics = np.clip(physics, 0.5, 120.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = pred / safe_physics
+    extreme = (ratio < 1.0 / 3.0) | (ratio > 3.0) | ~np.isfinite(ratio)
+    pred = np.where(extreme, 0.4 * pred + 0.6 * safe_physics, pred)
+
+    return np.clip(pred, 0.5, 120.0)
+
+
+def _train_stratified(train_df: pd.DataFrame,
+                      val_df: pd.DataFrame,
+                      min_subset_rows: int = 1000) -> Dict:
+    """
+    Train weekday vs. weekend models if each subset has enough rows;
+    otherwise fall back to a single model. Weekday = Mon-Fri, weekend = Sat-Sun
+    (driven off the `is_weekend` column already in the feature set).
+
+    Returns a dict with key either 'single' or both 'weekday' and 'weekend'.
+    """
+    wk_mask = (train_df["is_weekend"] == 0).values
+    we_mask = (train_df["is_weekend"] == 1).values
+    n_wk, n_we = int(wk_mask.sum()), int(we_mask.sum())
+
+    if n_wk < min_subset_rows or n_we < min_subset_rows:
+        print(f"  Stratification skipped (weekday={n_wk}, weekend={n_we}, "
+              f"min={min_subset_rows}); training one model.")
+        return {"single": train_catboost(train_df, val_df)}
+
+    wk_val = val_df[val_df["is_weekend"] == 0] if len(val_df) else val_df
+    we_val = val_df[val_df["is_weekend"] == 1] if len(val_df) else val_df
+    print(f"  Weekday model: train={n_wk}, val={len(wk_val)}")
+    m_wk = train_catboost(train_df[wk_mask], wk_val if len(wk_val) > 0 else None)
+    print(f"  Weekend model: train={n_we}, val={len(we_val)}")
+    m_we = train_catboost(train_df[we_mask], we_val if len(we_val) > 0 else None)
+    return {"weekday": m_wk, "weekend": m_we}
+
+
+def _predict_stratified(models: Dict, df: pd.DataFrame) -> np.ndarray:
+    """Route each row to the matching stratified model."""
+    if "single" in models:
+        return predict_catboost(models["single"], df)
+    pred = np.zeros(len(df), dtype=float)
+    is_we = (df["is_weekend"] == 1).values
+    if (~is_we).any():
+        pred[~is_we] = predict_catboost(models["weekday"], df[~is_we])
+    if is_we.any():
+        pred[is_we] = predict_catboost(models["weekend"], df[is_we])
+    return pred
+
+
 def predict_catboost(model, df: pd.DataFrame, use_log_target: bool = True):
     X = df[FEATURE_COLS].copy()
     for c in CAT_COLS:
@@ -663,56 +1003,115 @@ def quick_diagnostics(
     graphml_path: str = "sf_road_network.graphml",
     traj_dir: str = "Trajectories",
     stage2_speeds_path: str = "complete_speeds.pkl",
+    vehicle_features_path: str = "vehicle_features.pkl",
+    weather_cache_path: str = "sf_weather.pkl",
     test_csv: str = "kaggle-test-file-minute.csv",
-    sample_train_files: int = 50,  # Just sample to save time
+    sample_train_files: int = 50,
 ):
-    """Run diagnostics without training - takes ~5 minutes instead of 30"""
-    
-    print("="*60)
+    """Smoke-test the full feature pipeline on a small sample.
+
+    Asserts:
+      a) all expected feature columns are present and non-null after fill
+      b) route_n_edges is not a constant (predecessor reconstruction works)
+      c) weather-column hit rate >= 95% of sampled rows
+    """
+
+    print("=" * 60)
     print("QUICK DIAGNOSTICS (no training)")
-    print("="*60)
-    
-    # --- Load network ---
+    print("=" * 60)
+
     print("\n1. Loading road network...")
     G, edges_gdf, kdtree, edge_index = load_road_network(graphml_path)
-    
-    # --- Load Stage 2 speeds ---
+
     print("2. Loading Stage 2 speeds...")
     with open(stage2_speeds_path, "rb") as f:
         complete_speeds = pickle.load(f)
     speed_lookup = make_speed_lookup_from_stage2(complete_speeds)
     physics = PhysicsETA(G, edges_gdf, speed_lookup)
-    
-    # --- Build SMALL training sample ---
+
+    vehicle_features: Dict = {}
+    if os.path.exists(vehicle_features_path):
+        with open(vehicle_features_path, "rb") as f:
+            vehicle_features = pickle.load(f)
+    print(f"   vehicle_features entries: {len(vehicle_features)}")
+
+    try:
+        weather_df = load_sf_weather(cache_path=weather_cache_path)
+    except Exception as e:
+        print(f"   WARNING: weather fetch failed ({e}); using empty frame")
+        weather_df = pd.DataFrame(
+            columns=["timestamp_hour", "temp_c", "precip_mm", "wind_kph", "condition"]
+        )
+
     print(f"3. Building training sample ({sample_train_files} files)...")
     train_raw = build_training_rows_from_trajectories(
         traj_dir, max_files=sample_train_files, prefix_samples_per_trip=2
     )
-    
-    # --- Feature engineering on train sample ---
+
     print("4. Feature engineering (train sample)...")
     train_df = add_basic_features(train_raw)
     train_df, km_src, km_dst = add_cluster_features(train_df, n_clusters=80)
-    
-    # Only do physics on a small subset to save time
+
     print("   Physics features (1000 sample rows)...")
-    train_sample = train_df.sample(min(1000, len(train_df)), random_state=42)
+    train_sample = train_df.sample(
+        min(1000, len(train_df)), random_state=42
+    ).reset_index(drop=True)
     train_sample = add_physics_features(train_sample, physics)
-    
-    # --- Load and process test set ---
-    print("5. Loading test set...")
+    train_sample = add_historical_features(train_sample)
+    train_sample, v_medians = add_vehicle_features(train_sample, vehicle_features)
+    train_sample = add_weather_features(train_sample, weather_df)
+
+    # --- Assertions ---
+    print("\nAssertions:")
+    missing = [c for c in FEATURE_COLS if c not in train_sample.columns]
+    assert not missing, f"Missing feature columns: {missing}"
+    print(f"   (a) all {len(FEATURE_COLS)} feature columns present — OK")
+
+    null_cols = [c for c in FEATURE_COLS if train_sample[c].isna().any()]
+    assert not null_cols, f"Columns with NaNs after fill: {null_cols}"
+    print("   (a) no NaNs in feature columns — OK")
+
+    n_unique_edges = train_sample["route_n_edges"].nunique()
+    assert n_unique_edges > 1, (
+        f"route_n_edges is constant ({n_unique_edges} unique values) — "
+        "predecessor reconstruction is broken"
+    )
+    print(f"   (b) route_n_edges has {n_unique_edges} unique values — OK")
+
+    if len(weather_df) > 0:
+        hit_rate = 1.0 - train_sample["temp_c"].isna().mean()
+        # After fill there shouldn't be NaNs, so measure pre-fill by re-merging
+        probe = train_sample[["source_time"]].copy()
+        probe["_h"] = probe["source_time"].apply(lambda ts: floor_to_hour_utc(int(ts)))
+        merged = probe.merge(
+            weather_df[["timestamp_hour", "temp_c"]].rename(
+                columns={"timestamp_hour": "_h"}
+            ),
+            on="_h", how="left",
+        )
+        hit_rate = 1.0 - merged["temp_c"].isna().mean()
+        print(f"   (c) weather merge hit rate: {hit_rate:.1%}")
+        assert hit_rate >= 0.95, f"Weather hit rate too low: {hit_rate:.1%}"
+
+    print("\n5. Loading test set...")
     test_df = pd.read_csv(test_csv)
     test_df["source_time"] = test_df["source_time"].apply(parse_test_time)
-    test_df["duration_min"] = 0.0  # Dummy
-    
+    test_df["duration_min"] = 0.0
+
     print("6. Feature engineering (test)...")
     test_df = add_basic_features(test_df)
     test_df, _, _ = add_cluster_features(test_df, km_src, km_dst)
-    
-    # Physics on sample of test
-    print("   Physics features (1000 test rows)...")
-    test_sample = test_df.sample(min(1000, len(test_df)), random_state=42)
+
+    test_sample = test_df.sample(
+        min(1000, len(test_df)), random_state=42
+    ).reset_index(drop=True)
     test_sample = add_physics_features(test_sample, physics)
+    test_sample = add_historical_features(test_sample, train_df=train_sample)
+    test_sample, _ = add_vehicle_features(
+        test_sample, vehicle_features, fallback_medians=v_medians
+    )
+    test_sample = add_weather_features(test_sample, weather_df)
+    print(f"   test sample columns OK: {len(test_sample.columns)}")
 
 
 # ---------------------------------------------------------------------------
@@ -722,13 +1121,16 @@ def main(
     graphml_path: str = "sf_road_network.graphml",
     traj_dir: str = "Trajectories",
     stage2_speeds_path: str = "complete_speeds.pkl",
+    vehicle_features_path: str = "vehicle_features.pkl",
+    weather_cache_path: str = "sf_weather.pkl",
     test_csv: str = "kaggle-test-file-minute.csv",
     submission_csv: str = "submission.csv",
     max_train_files: Optional[int] = None,
     val_days: int = 3,
 ):
     """End-to-end pipeline. Assumes Stage 1 and Stage 2 have already run
-    and produced `complete_speeds.pkl` (pickle of the dict)."""
+    and produced `complete_speeds.pkl` (pickle of the dict), and that
+    process_test_cases.py has produced `vehicle_features.pkl`."""
 
     # --- Load network ---
     print("=" * 60)
@@ -741,6 +1143,26 @@ def main(
         complete_speeds = pickle.load(f)
     print(f"  {len(complete_speeds)} (edge, time_bin) entries")
     speed_lookup = make_speed_lookup_from_stage2(complete_speeds)
+
+    # --- Load vehicle features (may be empty dict if process_test_cases hasn't run) ---
+    vehicle_features: Dict = {}
+    if os.path.exists(vehicle_features_path):
+        with open(vehicle_features_path, "rb") as f:
+            vehicle_features = pickle.load(f)
+        print(f"  Loaded {len(vehicle_features)} vehicle feature entries")
+    else:
+        print(f"  WARNING: {vehicle_features_path} not found — v_* features will be medians only")
+
+    # --- Load SF weather ---
+    print("\nLoading SF weather...")
+    try:
+        weather_df = load_sf_weather(cache_path=weather_cache_path)
+        print(f"  {len(weather_df)} hourly weather rows")
+    except Exception as e:
+        print(f"  WARNING: weather fetch failed ({e}); using empty frame")
+        weather_df = pd.DataFrame(
+            columns=["timestamp_hour", "temp_c", "precip_mm", "wind_kph", "condition"]
+        )
 
     # --- Build physics engine ---
     physics = PhysicsETA(G, edges_gdf, speed_lookup)
@@ -758,50 +1180,77 @@ def main(
     val_df = train_raw[train_raw["source_time"] > cutoff_ts].copy()
     print(f"  Train: {len(train_df)}   Val: {len(val_df)}")
 
-    # --- Feature engineering ---
+    # --- Feature engineering (train) ---
     print("\nFeature engineering (train)...")
     train_df = add_basic_features(train_df)
     train_df, km_src, km_dst = add_cluster_features(train_df, n_clusters=80)
     print("  Adding physics features (this is the slow step)...")
     train_df = add_physics_features(train_df, physics)
     train_df = add_historical_features(train_df)
+    train_df, v_medians = add_vehicle_features(train_df, vehicle_features)
+    train_df = add_weather_features(train_df, weather_df)
 
+    # --- Feature engineering (val) ---
     print("\nFeature engineering (val)...")
     val_df = add_basic_features(val_df)
     val_df, _, _ = add_cluster_features(val_df, km_src, km_dst)
     val_df = add_physics_features(val_df, physics)
     val_df = add_historical_features(val_df, train_df=train_df)
+    val_df, _ = add_vehicle_features(val_df, vehicle_features, fallback_medians=v_medians)
+    val_df = add_weather_features(val_df, weather_df)
 
-    # --- Train model ---
-    print("\nTraining CatBoost...")
-    model = train_catboost(train_df, val_df)
+    # --- Train model (weekday/weekend stratified when data supports it) ---
+    print("\nTraining CatBoost (stratified)...")
+    models = _train_stratified(train_df, val_df)
 
     # --- Score val set ---
-    val_pred = predict_catboost(model, val_df)
+    val_pred = _predict_stratified(models, val_df)
     rmse = float(np.sqrt(np.mean((val_pred - val_df["duration_min"]) ** 2)))
     print(f"\nValidation RMSE (minutes): {rmse:.4f}")
 
-    # Also report physics-only baseline for comparison
+    # Weekday/weekend RMSE split so we can see whether stratification helped
+    val_is_we = (val_df["is_weekend"] == 1).values
+    if val_is_we.any() and (~val_is_we).any():
+        rmse_wk = float(np.sqrt(np.mean(
+            (val_pred[~val_is_we] - val_df["duration_min"].values[~val_is_we]) ** 2
+        )))
+        rmse_we = float(np.sqrt(np.mean(
+            (val_pred[val_is_we] - val_df["duration_min"].values[val_is_we]) ** 2
+        )))
+        print(f"  weekday RMSE: {rmse_wk:.4f}  (n={int((~val_is_we).sum())})")
+        print(f"  weekend RMSE: {rmse_we:.4f}  (n={int(val_is_we.sum())})")
+
+    # Physics-only baselines for comparison
     phys_rmse = float(np.sqrt(np.mean(
         (val_df["physics_eta_min"] - val_df["duration_min"]) ** 2
     )))
-    print(f"Physics-only baseline RMSE: {phys_rmse:.4f}")
+    phys_snap_rmse = float(np.sqrt(np.mean(
+        (val_df["physics_eta_snapshot_min"] - val_df["duration_min"]) ** 2
+    )))
+    print(f"Physics-only (rolling) baseline RMSE: {phys_rmse:.4f}")
+    print(f"Physics-only (snapshot) baseline RMSE: {phys_snap_rmse:.4f}")
 
     # --- Predict on test ---
     print("\nLoading test set...")
     test_df = pd.read_csv(test_csv)
     test_df["source_time"] = test_df["source_time"].apply(parse_test_time)
-    # Test set has no duration_min; we add a dummy so the feature funcs don't break
-    test_df["duration_min"] = 0.0
+    test_df["duration_min"] = 0.0  # dummy for feature funcs
 
     test_df = add_basic_features(test_df)
     test_df, _, _ = add_cluster_features(test_df, km_src, km_dst)
     print("  Physics features for test set...")
     test_df = add_physics_features(test_df, physics)
     test_df = add_historical_features(test_df, train_df=train_df)
+    test_df, _ = add_vehicle_features(test_df, vehicle_features, fallback_medians=v_medians)
+    test_df = add_weather_features(test_df, weather_df)
 
-    pred_min = predict_catboost(model, test_df)
-    pred_min = np.clip(pred_min, 0.5, 120.0)
+    pred_raw = _predict_stratified(models, test_df)
+    pred_min = apply_sanity_fallback(pred_raw, test_df)
+
+    # Visibility: how many predictions were adjusted by the fallback
+    n_adjusted = int(np.sum(np.abs(pred_raw - pred_min) > 0.5))
+    print(f"  sanity fallback adjusted {n_adjusted} / {len(pred_min)} predictions "
+          f"by more than 0.5 min")
 
     submission = pd.DataFrame({
         "id": test_df["id"],
@@ -810,7 +1259,7 @@ def main(
     submission.to_csv(submission_csv, index=False)
     print(f"\nSubmission written to {submission_csv}  ({len(submission)} rows)")
 
-    return model, train_df, val_df, test_df
+    return models, train_df, val_df, test_df
 
 
 if __name__ == "__main__":

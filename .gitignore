@@ -57,7 +57,19 @@ complete_speeds.*.pkl
 observed_speeds.pkl
 observed_speeds.*.pkl
 vehicle_features.pkl
+matching_params.pkl
+sf_weather.pkl
 *.partial.pkl
+
+# Map-matching per-file cache (populated by run_stage2_full.py)
+matched_cache/
+
+# OSMnx network cache
+cache/
+
+# Metrics + runtime artifacts
+baseline_metrics.txt
+pipeline.pid
 
 # Kaggle test file (may be under a competition license)
 kaggle-test-file-minute.csv
