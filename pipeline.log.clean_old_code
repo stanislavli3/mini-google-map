@@ -1,0 +1,37 @@
+============================================================
+Loading road network...
+Loading road network from sf_road_network.graphml...
+  Nodes: 10020,  Edges: 27594
+  Spatial index built.
+
+Loading Stage 2 speed dictionary...
+  7342115 (edge, time_bin) entries
+  Loaded 50 vehicle feature entries
+
+Loading SF weather...
+  17534 hourly weather rows
+
+Building training set from trajectories...
+  processed 50/486 files, 198012 rows so far
+  processed 100/486 files, 383251 rows so far
+  processed 150/486 files, 590009 rows so far
+  processed 200/486 files, 802308 rows so far
+  processed 250/486 files, 1004970 rows so far
+  processed 300/486 files, 1218983 rows so far
+  processed 350/486 files, 1429546 rows so far
+  processed 400/486 files, 1637181 rows so far
+  processed 450/486 files, 1823579 rows so far
+
+Built 1961299 training rows from 486 files.
+  Train: 1750508   Val: 210791
+
+Feature engineering (train)...
+  Adding physics features (this is the slow step)...
+
+Feature engineering (val)...
+
+Training CatBoost (stratified)...
+  Weekday model: train=1147636, val=69794
+0:	learn: 0.5692384	test: 0.5787501	best: 0.5787501 (0)	total: 419ms	remaining: 34m 52s
+200:	learn: 0.3359280	test: 0.3720279	best: 0.3720243 (199)	total: 3m 10s	remaining: 1h 15m 37s
+400:	learn: 0.3246289	test: 0.3809243	best: 0.3720243 (199)	total: 6m 22s	remaining: 1h 13m 7s

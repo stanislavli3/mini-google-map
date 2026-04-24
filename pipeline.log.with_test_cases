@@ -1,0 +1,66 @@
+============================================================
+Loading road network...
+Loading road network from sf_road_network.graphml...
+  Nodes: 10020,  Edges: 27594
+  Spatial index built.
+
+Loading Stage 2 speed dictionary...
+  7342115 (edge, time_bin) entries
+  Loaded 50 vehicle feature entries
+
+Loading SF weather...
+  17534 hourly weather rows
+
+Building training set from trajectories...
+  processed 50/536 files, 198012 rows so far
+  processed 100/536 files, 383251 rows so far
+  processed 150/536 files, 590009 rows so far
+  processed 200/536 files, 802308 rows so far
+  processed 250/536 files, 1004970 rows so far
+  processed 300/536 files, 1218983 rows so far
+  processed 350/536 files, 1429546 rows so far
+  processed 400/536 files, 1637181 rows so far
+  processed 450/536 files, 1823579 rows so far
+  processed 500/536 files, 1981796 rows so far
+
+Built 2029869 training rows from 536 files.
+  Train: 1811618   Val: 218251
+
+Feature engineering (train)...
+  Adding physics features (this is the slow step)...
+
+Feature engineering (val)...
+
+Training CatBoost (stratified)...
+  Weekday model: train=1186816, val=72457
+0:	learn: 0.5848918	test: 0.5930848	best: 0.5930848 (0)	total: 745ms	remaining: 1h 2m 3s
+200:	learn: 0.3536651	test: 0.3892878	best: 0.3891796 (162)	total: 2m 26s	remaining: 58m 8s
+400:	learn: 0.3423234	test: 0.3951437	best: 0.3891796 (162)	total: 4m 52s	remaining: 55m 56s
+Stopped by overfitting detector  (300 iterations wait)
+
+bestTest = 0.3891796093
+bestIteration = 162
+
+Shrink model to first 163 iterations.
+  Weekend model: train=624802, val=145794
+0:	learn: 0.5705968	test: 0.5713197	best: 0.5713197 (0)	total: 397ms	remaining: 33m 2s
+200:	learn: 0.3348988	test: 0.3536764	best: 0.3535393 (196)	total: 1m 4s	remaining: 25m 50s
+400:	learn: 0.3227533	test: 0.3552181	best: 0.3529488 (261)	total: 2m 11s	remaining: 25m 10s
+Stopped by overfitting detector  (300 iterations wait)
+
+bestTest = 0.3529488498
+bestIteration = 261
+
+Shrink model to first 262 iterations.
+
+Validation RMSE (minutes): 7.9677
+  weekday RMSE: 9.1920  (n=72457)
+  weekend RMSE: 7.2831  (n=145794)
+Physics-only (rolling) baseline RMSE: 9.3391
+Physics-only (snapshot) baseline RMSE: 9.3351
+
+Loading test set...
+  Physics features for test set...
+  sanity fallback adjusted 109 / 385 predictions by more than 0.5 min
+
+Submission written to submission.csv  (385 rows)
