@@ -13,6 +13,7 @@ Jinja2==3.1.6
 joblib==1.5.3
 kiwisolver==1.5.0
 MarkupSafe==3.0.3
+lightgbm==4.6.0
 matplotlib==3.10.8
 meteostat==1.6.8
 narwhals==2.20.0

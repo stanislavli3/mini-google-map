@@ -71,6 +71,12 @@ cache/
 baseline_metrics.txt
 pipeline.pid
 
+# Round-2 synthesized/derived artifacts
+kaggle_like_val.csv
+test_cases_trip_durations.npy
+vehicle_features.pkl.*.bak
+vehicle_features.pkl.before_per_hour.bak
+
 # Kaggle test file (may be under a competition license)
 kaggle-test-file-minute.csv
 
@@ -88,6 +94,7 @@ traffic_speed_map.html
 test_cases.log
 stage2.log
 *.log
+pipeline.log.*
 nohup.out
 
 # CatBoost training artifacts (regenerable)

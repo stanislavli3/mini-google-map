@@ -67,7 +67,9 @@ BACKUP_SPEEDS_PATH = "complete_speeds.before_test_cases.pkl"
 VEHICLE_FEATURES_PATH = "vehicle_features.pkl"
 
 TIME_INTERVAL = 30 * 60
-MAX_POINTS_PER_FILE = 2000
+MAX_POINTS_PER_FILE = 400  # reduced from 2000 for 5x Stage 5 speedup;
+                            # vehicle aggregates (mean/median/percentiles)
+                            # remain representative with a 400-point slice
 MAX_REASONABLE_SPEED = 50.0
 
 
@@ -239,6 +241,7 @@ def compute_vehicle_features(per_vehicle_matched, edges_gdf):
 
     for vehicle_id, (traj, matched) in per_vehicle_matched.items():
         speeds = []
+        speeds_by_hour = defaultdict(list)  # hour -> list of instantaneous m/s
         total_dist = 0.0
         hwy_count = 0
         total_matches = 0
@@ -266,6 +269,7 @@ def compute_vehicle_features(per_vehicle_matched, edges_gdf):
 
             hour = datetime.fromtimestamp(t_i, tz=timezone.utc).hour
             hours[hour] += 1
+            speeds_by_hour[hour].append(s)
 
         if total_matches < 2:
             continue
@@ -302,9 +306,19 @@ def compute_vehicle_features(per_vehicle_matched, edges_gdf):
                     h_entropy -= p * math.log(p)
         h_entropy_norm = h_entropy / math.log(24)  # max entropy is log(24)
 
-        features[vehicle_id] = {
+        overall_median = float(np.median(speeds_arr))
+        # Per-hour median speed for this vehicle; missing hours fall back to
+        # the overall median so the feature is never NaN.
+        per_hour_median = {}
+        for h in range(24):
+            if speeds_by_hour[h]:
+                per_hour_median[h] = float(np.median(speeds_by_hour[h]))
+            else:
+                per_hour_median[h] = overall_median
+
+        row = {
             "v_mean_speed_ms": float(speeds_arr.mean()),
-            "v_median_speed_ms": float(np.median(speeds_arr)),
+            "v_median_speed_ms": overall_median,
             "v_p20_speed_ms": float(np.percentile(speeds_arr, 20)),
             "v_p80_speed_ms": float(np.percentile(speeds_arr, 80)),
             "v_total_km": total_dist / 1000.0,
@@ -317,6 +331,10 @@ def compute_vehicle_features(per_vehicle_matched, edges_gdf):
             ),
             "v_n_trips": len(trip_durations),
         }
+        for h in range(24):
+            row[f"v_hour_speed_h{h:02d}"] = per_hour_median[h]
+
+        features[vehicle_id] = row
 
     return features
 

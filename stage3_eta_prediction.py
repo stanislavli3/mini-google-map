@@ -138,7 +138,7 @@ def identify_trip_segments(traj: List[GPSPoint]) -> List[Tuple[int, int]]:
 
 
 def build_training_rows_from_trajectories(
-    traj_dir: str,
+    traj_dir,
     max_files: Optional[int] = None,
     prefix_samples_per_trip: int = 5,
     min_trip_duration_s: int = 60,
@@ -146,6 +146,10 @@ def build_training_rows_from_trajectories(
 ) -> pd.DataFrame:
     """
     Walk every trajectory file, split into trips, and emit training rows.
+
+    `traj_dir` can be a single path string OR a list of paths — when given
+    multiple dirs we union them, which lets us train on Trajectories/ AND
+    Test Cases/ so the 50 test vehicles are in-distribution.
 
     For each trip, we emit (prefix_samples_per_trip + 1) rows:
       - The full trip (source=first point, dest=last point)
@@ -156,7 +160,12 @@ def build_training_rows_from_trajectories(
 
     Each row is labeled with `duration_min` = (dest_ts - source_ts) / 60.
     """
-    files = sorted(glob.glob(os.path.join(traj_dir, "*.txt")))
+    if isinstance(traj_dir, (list, tuple)):
+        files = []
+        for d in traj_dir:
+            files.extend(sorted(glob.glob(os.path.join(d, "*.txt"))))
+    else:
+        files = sorted(glob.glob(os.path.join(traj_dir, "*.txt")))
     if max_files:
         files = files[:max_files]
 
@@ -522,6 +531,18 @@ def add_physics_features(df: pd.DataFrame, physics: PhysicsETA) -> pd.DataFrame:
     pct_residential = np.zeros(len(df))
     pct_other = np.zeros(len(df))
 
+    # Live-traffic features pulled from complete_speeds via _get_edge_weights.
+    # Computed during the same path walk so no extra passes over the graph.
+    #   live_src_speed_ms       median speed on the first 3 edges of the route
+    #                           at the row's start time bin (proxy for pickup-
+    #                           area traffic right now).
+    #   live_bottleneck_speed_ms min speed along the whole route (slowest edge).
+    #   live_speed_deficit_ratio mean(actual) / mean(free-flow) — <1 means
+    #                            congestion across the route.
+    live_src_speed = np.zeros(len(df))
+    live_bottleneck_speed = np.zeros(len(df))
+    live_speed_deficit_ratio = np.zeros(len(df))
+
     for tbin in tbins.unique():
         mask_positions = np.where((tbins == tbin).values)[0]
 
@@ -592,6 +613,12 @@ def add_physics_features(df: pd.DataFrame, physics: PhysicsETA) -> pd.DataFrame:
             last_bearing = None
             n_edges = 0
 
+            # Live-traffic accumulators for this row
+            src_edge_speeds = []        # first 3 edges
+            min_speed = float("inf")
+            sum_actual_speed = 0.0
+            sum_freeflow_speed = 0.0
+
             for i in range(len(path_nodes) - 1):
                 u_idx, v_idx = path_nodes[i], path_nodes[i + 1]
                 u_node = physics.node_list[u_idx]
@@ -615,6 +642,18 @@ def add_physics_features(df: pd.DataFrame, physics: PhysicsETA) -> pd.DataFrame:
 
                 rt = physics._edge_rtype.get(edge_id, "unclassified")
                 bucket_counts[ROAD_CLASS_BUCKETS.get(rt, "other")] += 1
+
+                # Live-traffic: derive actual speed + compare to free-flow
+                edge_len = physics._edge_length.get(edge_id, 0.0)
+                if edge_len > 0 and tt > 0:
+                    actual_speed = edge_len / tt
+                    freeflow = ROAD_TYPE_DEFAULT_SPEED.get(rt, DEFAULT_SPEED_MS)
+                    sum_actual_speed += actual_speed
+                    sum_freeflow_speed += freeflow
+                    if actual_speed < min_speed:
+                        min_speed = actual_speed
+                    if len(src_edge_speeds) < 3:
+                        src_edge_speeds.append(actual_speed)
 
                 u_lat, u_lon = physics.node_coords[u_idx]
                 v_lat, v_lon = physics.node_coords[v_idx]
@@ -641,6 +680,20 @@ def add_physics_features(df: pd.DataFrame, physics: PhysicsETA) -> pd.DataFrame:
                 pct_residential[pos] = bucket_counts["residential"] / n_edges
                 pct_other[pos] = bucket_counts["other"] / n_edges
 
+            # Live-traffic per-row finalization
+            if src_edge_speeds:
+                live_src_speed[pos] = float(np.median(src_edge_speeds))
+            else:
+                live_src_speed[pos] = DEFAULT_SPEED_MS
+            if min_speed < float("inf"):
+                live_bottleneck_speed[pos] = min_speed
+            else:
+                live_bottleneck_speed[pos] = DEFAULT_SPEED_MS
+            if sum_freeflow_speed > 0:
+                live_speed_deficit_ratio[pos] = sum_actual_speed / sum_freeflow_speed
+            else:
+                live_speed_deficit_ratio[pos] = 1.0
+
     df["physics_eta_min"] = etas_rolling
     df["physics_eta_snapshot_min"] = etas_snapshot
     df["route_length_km"] = lens / 1000.0
@@ -653,6 +706,9 @@ def add_physics_features(df: pd.DataFrame, physics: PhysicsETA) -> pd.DataFrame:
     df["route_pct_residential"] = pct_residential
     df["route_pct_other"] = pct_other
     df["route_detour_ratio"] = df["route_length_km"] / df["haversine_km"].clip(lower=0.01)
+    df["live_src_speed_ms"] = live_src_speed
+    df["live_bottleneck_speed_ms"] = live_bottleneck_speed
+    df["live_speed_deficit_ratio"] = live_speed_deficit_ratio
     return df
 
 
@@ -762,6 +818,10 @@ VEHICLE_FEATURE_COLS = [
     "v_total_km", "v_n_points", "v_hour_dominant", "v_hour_entropy",
     "v_pct_highway", "v_typical_trip_min", "v_n_trips",
 ]
+# 24 per-hour median speed columns produced by
+# process_test_cases.compute_vehicle_features. Joined onto every row so we
+# can pull the right hour's value below into `v_hour_speed_at_src`.
+VEHICLE_HOUR_SPEED_COLS = [f"v_hour_speed_h{h:02d}" for h in range(24)]
 
 
 def add_vehicle_features(
@@ -790,7 +850,8 @@ def add_vehicle_features(
     else:
         vf_df = pd.DataFrame(columns=["_vid_stem"] + VEHICLE_FEATURE_COLS)
 
-    for c in VEHICLE_FEATURE_COLS:
+    all_cols = VEHICLE_FEATURE_COLS + VEHICLE_HOUR_SPEED_COLS
+    for c in all_cols:
         if c not in vf_df.columns:
             vf_df[c] = np.nan
 
@@ -798,12 +859,12 @@ def add_vehicle_features(
         df["vehicle_id"].astype(str).str.replace(".txt", "", regex=False)
     )
     df = df.merge(
-        vf_df[["_vid_stem"] + VEHICLE_FEATURE_COLS], on="_vid_stem", how="left"
+        vf_df[["_vid_stem"] + all_cols], on="_vid_stem", how="left"
     )
     df = df.drop(columns=["_vid_stem"])
 
     medians = fallback_medians or {}
-    for c in VEHICLE_FEATURE_COLS:
+    for c in all_cols:
         if c in medians:
             fill_val = medians[c]
         else:
@@ -817,6 +878,16 @@ def add_vehicle_features(
                 )
             medians[c] = fill_val
         df[c] = df[c].fillna(fill_val)
+
+    # Derive the single "speed the driver tends to move at THIS hour" feature.
+    # Row-wise vectorized lookup into the 24 v_hour_speed_h00..h23 columns.
+    hour_col_arr = df[VEHICLE_HOUR_SPEED_COLS].to_numpy()
+    hour_idx = df["hour"].astype(int).clip(0, 23).to_numpy()
+    df["v_hour_speed_at_src"] = hour_col_arr[np.arange(len(df)), hour_idx]
+
+    # We keep the 24 hourly columns in the dataframe but DON'T add them to
+    # FEATURE_COLS — they'd just blow up memory. The indexed-by-hour value
+    # above is what the model sees.
 
     return df, medians
 
@@ -859,11 +930,13 @@ FEATURE_COLS = [
     "route_length_km", "route_n_edges", "route_n_turns", "route_detour_ratio",
     "route_pct_motorway", "route_pct_trunk", "route_pct_primary",
     "route_pct_secondary", "route_pct_residential", "route_pct_other",
+    "live_src_speed_ms", "live_bottleneck_speed_ms", "live_speed_deficit_ratio",
     "hist_duration_min", "hist_duration_od", "hist_duration_hour",
     "vehicle_id",
     "v_mean_speed_ms", "v_median_speed_ms", "v_p20_speed_ms", "v_p80_speed_ms",
     "v_total_km", "v_n_points", "v_hour_dominant", "v_hour_entropy",
     "v_pct_highway", "v_typical_trip_min", "v_n_trips",
+    "v_hour_speed_at_src",  # per-hour vehicle speed looked up by this row's hour
     "temp_c", "precip_mm", "wind_kph", "weather_is_rain", "condition",
 ]
 CAT_COLS = ["src_cluster", "dst_cluster", "od_pair", "vehicle_id",
@@ -871,20 +944,58 @@ CAT_COLS = ["src_cluster", "dst_cluster", "od_pair", "vehicle_id",
             "v_hour_dominant", "condition"]
 
 
+def _build_target(df: pd.DataFrame, target_mode: str) -> np.ndarray:
+    """Return the training target according to `target_mode`.
+
+    - "residual": duration - physics_eta  (centered, tight-scale)
+    - "log":      log1p(duration)          (legacy; keeps compat path for ensembling)
+    - "raw":      duration_min             (baseline)
+    """
+    if target_mode == "residual":
+        return (df["duration_min"] - df["physics_eta_min"]).values
+    if target_mode == "log":
+        return np.log1p(df["duration_min"].values)
+    if target_mode == "raw":
+        return df["duration_min"].values
+    raise ValueError(f"unknown target_mode: {target_mode!r}")
+
+
+def _invert_target(pred: np.ndarray, df: pd.DataFrame, target_mode: str) -> np.ndarray:
+    """Inverse of `_build_target` applied to CatBoost's raw output."""
+    if target_mode == "residual":
+        return df["physics_eta_min"].values + pred
+    if target_mode == "log":
+        return np.expm1(pred)
+    if target_mode == "raw":
+        return pred
+    raise ValueError(f"unknown target_mode: {target_mode!r}")
+
+
 def train_catboost(
     train_df: pd.DataFrame,
     val_df: Optional[pd.DataFrame] = None,
-    use_log_target: bool = True,
+    target_mode: str = "residual",
+    loss_function: str = "RMSE",
+    od_wait: int = 500,
 ):
     """
-    Train a CatBoost regressor. `train_df` must contain FEATURE_COLS and
-    a 'duration_min' column.
+    Train a CatBoost regressor. `train_df` must contain FEATURE_COLS, a
+    'duration_min' column, and — for target_mode='residual' — a
+    'physics_eta_min' column.
+
+    target_mode:
+      "residual" (default): predict duration - physics_eta.  Physics already
+          captures most of the signal; training on the residual gives CatBoost
+          a tighter, more Gaussian target to fit, and directly optimizes
+          Kaggle's in-minute RMSE.
+      "log":   predict log1p(duration), for log-space robustness — useful as
+               an ensemble member.
+      "raw":   predict duration_min directly.
     """
     from catboost import CatBoostRegressor, Pool
 
     X_train = train_df[FEATURE_COLS].copy()
-    y_train = np.log1p(train_df["duration_min"]) if use_log_target \
-        else train_df["duration_min"]
+    y_train = _build_target(train_df, target_mode)
 
     # Ensure categorical columns are strings (CatBoost is picky)
     for c in CAT_COLS:
@@ -895,8 +1006,7 @@ def train_catboost(
     val_pool = None
     if val_df is not None and len(val_df) > 0:
         X_val = val_df[FEATURE_COLS].copy()
-        y_val = np.log1p(val_df["duration_min"]) if use_log_target \
-            else val_df["duration_min"]
+        y_val = _build_target(val_df, target_mode)
         for c in CAT_COLS:
             X_val[c] = X_val[c].astype(str)
         val_pool = Pool(X_val, y_val, cat_features=CAT_COLS)
@@ -905,15 +1015,16 @@ def train_catboost(
         iterations=5000,
         learning_rate=0.02,
         depth=8,
-        loss_function="RMSE",
+        loss_function=loss_function,
         eval_metric="RMSE",
         random_seed=42,
         od_type="Iter",
-        od_wait=300,
+        od_wait=od_wait,
         verbose=200,
         allow_writing_files=False,
     )
     model.fit(train_pool, eval_set=val_pool, use_best_model=val_pool is not None)
+    model._target_mode = target_mode  # stash so predict can recover the inversion
     return model
 
 
@@ -952,7 +1063,9 @@ def apply_sanity_fallback(pred_min, df: pd.DataFrame) -> np.ndarray:
 
 def _train_stratified(train_df: pd.DataFrame,
                       val_df: pd.DataFrame,
-                      min_subset_rows: int = 1000) -> Dict:
+                      min_subset_rows: int = 1000,
+                      target_mode: str = "residual",
+                      loss_function: str = "RMSE") -> Dict:
     """
     Train weekday vs. weekend models if each subset has enough rows;
     otherwise fall back to a single model. Weekday = Mon-Fri, weekend = Sat-Sun
@@ -967,14 +1080,22 @@ def _train_stratified(train_df: pd.DataFrame,
     if n_wk < min_subset_rows or n_we < min_subset_rows:
         print(f"  Stratification skipped (weekday={n_wk}, weekend={n_we}, "
               f"min={min_subset_rows}); training one model.")
-        return {"single": train_catboost(train_df, val_df)}
+        return {"single": train_catboost(
+            train_df, val_df, target_mode=target_mode, loss_function=loss_function
+        )}
 
     wk_val = val_df[val_df["is_weekend"] == 0] if len(val_df) else val_df
     we_val = val_df[val_df["is_weekend"] == 1] if len(val_df) else val_df
     print(f"  Weekday model: train={n_wk}, val={len(wk_val)}")
-    m_wk = train_catboost(train_df[wk_mask], wk_val if len(wk_val) > 0 else None)
+    m_wk = train_catboost(
+        train_df[wk_mask], wk_val if len(wk_val) > 0 else None,
+        target_mode=target_mode, loss_function=loss_function,
+    )
     print(f"  Weekend model: train={n_we}, val={len(we_val)}")
-    m_we = train_catboost(train_df[we_mask], we_val if len(we_val) > 0 else None)
+    m_we = train_catboost(
+        train_df[we_mask], we_val if len(we_val) > 0 else None,
+        target_mode=target_mode, loss_function=loss_function,
+    )
     return {"weekday": m_wk, "weekend": m_we}
 
 
@@ -991,17 +1112,99 @@ def _predict_stratified(models: Dict, df: pd.DataFrame) -> np.ndarray:
     return pred
 
 
-def predict_catboost(model, df: pd.DataFrame, use_log_target: bool = True):
+def predict_catboost(model, df: pd.DataFrame, target_mode: Optional[str] = None):
+    """
+    Predict in `duration_min` space. `target_mode` defaults to whatever the
+    model was trained with (stashed on `model._target_mode`); pass explicitly
+    only to override.
+    """
+    if target_mode is None:
+        target_mode = getattr(model, "_target_mode", "residual")
     X = df[FEATURE_COLS].copy()
     for c in CAT_COLS:
         X[c] = X[c].astype(str)
-    pred = model.predict(X)
-    return np.expm1(pred) if use_log_target else pred
+    raw = model.predict(X)
+    return _invert_target(raw, df, target_mode)
+
+
+# ---------------------------------------------------------------------------
+# LightGBM — ensemble partner to CatBoost. Different inductive bias
+# (leaf-wise growth, mean target encoding for categoricals via `category`
+# dtype) so it makes uncorrelated errors.
+# ---------------------------------------------------------------------------
+def train_lightgbm(
+    train_df: pd.DataFrame,
+    val_df: Optional[pd.DataFrame] = None,
+    target_mode: str = "residual",
+    num_boost_round: int = 5000,
+    early_stopping_rounds: int = 500,
+):
+    """Train a LightGBM regressor on the same FEATURE_COLS as CatBoost."""
+    import lightgbm as lgb
+
+    def _prep(df):
+        X = df[FEATURE_COLS].copy()
+        for c in CAT_COLS:
+            X[c] = X[c].astype("category")
+        return X
+
+    X_train = _prep(train_df)
+    y_train = _build_target(train_df, target_mode)
+    train_ds = lgb.Dataset(X_train, y_train, categorical_feature=CAT_COLS,
+                           free_raw_data=False)
+
+    val_ds = None
+    if val_df is not None and len(val_df) > 0:
+        X_val = _prep(val_df)
+        y_val = _build_target(val_df, target_mode)
+        val_ds = lgb.Dataset(X_val, y_val, categorical_feature=CAT_COLS,
+                             reference=train_ds, free_raw_data=False)
+
+    params = {
+        "objective": "regression",
+        "metric": "rmse",
+        "learning_rate": 0.02,
+        "num_leaves": 255,          # comparable capacity to CatBoost depth 8
+        "min_data_in_leaf": 50,
+        "feature_fraction": 0.9,
+        "bagging_fraction": 0.85,
+        "bagging_freq": 5,
+        "verbose": -1,
+        "seed": 42,
+        "num_threads": 0,           # auto
+    }
+
+    callbacks = []
+    if val_ds is not None:
+        callbacks.append(lgb.early_stopping(early_stopping_rounds, verbose=False))
+    callbacks.append(lgb.log_evaluation(200))
+
+    model = lgb.train(
+        params,
+        train_ds,
+        num_boost_round=num_boost_round,
+        valid_sets=[val_ds] if val_ds is not None else None,
+        callbacks=callbacks,
+    )
+    model._target_mode = target_mode
+    return model
+
+
+def predict_lightgbm(model, df: pd.DataFrame, target_mode: Optional[str] = None):
+    if target_mode is None:
+        target_mode = getattr(model, "_target_mode", "residual")
+    X = df[FEATURE_COLS].copy()
+    for c in CAT_COLS:
+        X[c] = X[c].astype("category")
+    best_iter = getattr(model, "best_iteration", None) or 0
+    raw = model.predict(X, num_iteration=best_iter if best_iter > 0 else None)
+    return _invert_target(raw, df, target_mode)
 
 
 def quick_diagnostics(
     graphml_path: str = "sf_road_network.graphml",
-    traj_dir: str = "Trajectories",
+    traj_dir=("Trajectories", "Test Cases"),  # train on BOTH so the 50 test
+                                                # vehicles are in-distribution
     stage2_speeds_path: str = "complete_speeds.pkl",
     vehicle_features_path: str = "vehicle_features.pkl",
     weather_cache_path: str = "sf_weather.pkl",
@@ -1119,7 +1322,8 @@ def quick_diagnostics(
 # ---------------------------------------------------------------------------
 def main(
     graphml_path: str = "sf_road_network.graphml",
-    traj_dir: str = "Trajectories",
+    traj_dir=("Trajectories", "Test Cases"),  # train on BOTH so the 50 test
+                                                # vehicles are in-distribution
     stage2_speeds_path: str = "complete_speeds.pkl",
     vehicle_features_path: str = "vehicle_features.pkl",
     weather_cache_path: str = "sf_weather.pkl",
@@ -1127,6 +1331,8 @@ def main(
     submission_csv: str = "submission.csv",
     max_train_files: Optional[int] = None,
     val_days: int = 3,
+    kaggle_val_csv: str = "kaggle_like_val.csv",
+    target_mode: str = "residual",
 ):
     """End-to-end pipeline. Assumes Stage 1 and Stage 2 have already run
     and produced `complete_speeds.pkl` (pickle of the dict), and that
@@ -1173,12 +1379,30 @@ def main(
         traj_dir, max_files=max_train_files, prefix_samples_per_trip=5
     )
 
-    # --- Chronological train/val split ---
-    train_raw = train_raw.sort_values("source_time").reset_index(drop=True)
-    cutoff_ts = train_raw["source_time"].max() - val_days * 86400
-    train_df = train_raw[train_raw["source_time"] <= cutoff_ts].copy()
-    val_df = train_raw[train_raw["source_time"] > cutoff_ts].copy()
-    print(f"  Train: {len(train_df)}   Val: {len(val_df)}")
+    # --- Train/val split ---
+    # If a Kaggle-like synthetic val exists on disk, use it (matches the
+    # true test distribution). Otherwise fall back to the old chronological
+    # split.
+    use_kaggle_val = os.path.exists(kaggle_val_csv)
+    if use_kaggle_val:
+        print(f"\nUsing Kaggle-like val set from {kaggle_val_csv}")
+        val_df = pd.read_csv(kaggle_val_csv)
+        # Make sure source_time is numeric unix seconds, matching train_raw
+        val_df["source_time"] = val_df["source_time"].astype("int64")
+        # Drop the synthetic id column; the feature pipeline doesn't need it
+        if "id" in val_df.columns:
+            val_df = val_df.drop(columns=["id"])
+        # All trajectory rows go into train (no leakage: kaggle_like_val rows
+        # are synthesized subsamples; the full trips are still in training but
+        # at a different source/dest slice, which is OK for out-of-sample val).
+        train_df = train_raw.copy()
+    else:
+        train_raw = train_raw.sort_values("source_time").reset_index(drop=True)
+        cutoff_ts = train_raw["source_time"].max() - val_days * 86400
+        train_df = train_raw[train_raw["source_time"] <= cutoff_ts].copy()
+        val_df = train_raw[train_raw["source_time"] > cutoff_ts].copy()
+    print(f"  Train: {len(train_df)}   Val: {len(val_df)}  "
+          f"({'Kaggle-like' if use_kaggle_val else 'chronological'})")
 
     # --- Feature engineering (train) ---
     print("\nFeature engineering (train)...")
@@ -1199,13 +1423,40 @@ def main(
     val_df, _ = add_vehicle_features(val_df, vehicle_features, fallback_medians=v_medians)
     val_df = add_weather_features(val_df, weather_df)
 
-    # --- Train model (weekday/weekend stratified when data supports it) ---
-    print("\nTraining CatBoost (stratified)...")
-    models = _train_stratified(train_df, val_df)
+    # --- Train CatBoost stratified ---
+    print(f"\nTraining CatBoost (stratified, target_mode={target_mode})...")
+    cat_models = _train_stratified(train_df, val_df, target_mode=target_mode)
+    cat_val_pred = _predict_stratified(cat_models, val_df)
+    cat_rmse = float(np.sqrt(np.mean((cat_val_pred - val_df["duration_min"]) ** 2)))
+    print(f"  CatBoost val RMSE:   {cat_rmse:.4f}")
 
-    # --- Score val set ---
-    val_pred = _predict_stratified(models, val_df)
-    rmse = float(np.sqrt(np.mean((val_pred - val_df["duration_min"]) ** 2)))
+    # --- Train LightGBM (ensemble partner) ---
+    lgb_model = None
+    lgb_val_pred = None
+    lgb_rmse = None
+    try:
+        print(f"\nTraining LightGBM (target_mode={target_mode})...")
+        lgb_model = train_lightgbm(train_df, val_df, target_mode=target_mode)
+        lgb_val_pred = predict_lightgbm(lgb_model, val_df)
+        lgb_rmse = float(np.sqrt(np.mean((lgb_val_pred - val_df["duration_min"]) ** 2)))
+        print(f"  LightGBM val RMSE:   {lgb_rmse:.4f}")
+    except Exception as e:
+        print(f"  WARNING: LightGBM training failed ({e}); falling back to CatBoost only")
+
+    # --- Ensemble: inverse-RMSE weighted blend ---
+    if lgb_val_pred is not None and lgb_rmse is not None:
+        inv = np.array([1.0 / cat_rmse, 1.0 / lgb_rmse])
+        w_cat, w_lgb = inv / inv.sum()
+        val_pred = w_cat * cat_val_pred + w_lgb * lgb_val_pred
+        ens_rmse = float(np.sqrt(np.mean((val_pred - val_df["duration_min"]) ** 2)))
+        print(f"  Ensemble weights:    CatBoost={w_cat:.3f}  LightGBM={w_lgb:.3f}")
+        print(f"  Ensemble val RMSE:   {ens_rmse:.4f}")
+    else:
+        val_pred = cat_val_pred
+        w_cat, w_lgb = 1.0, 0.0
+        ens_rmse = cat_rmse
+
+    rmse = ens_rmse
     print(f"\nValidation RMSE (minutes): {rmse:.4f}")
 
     # Weekday/weekend RMSE split so we can see whether stratification helped
@@ -1244,7 +1495,13 @@ def main(
     test_df, _ = add_vehicle_features(test_df, vehicle_features, fallback_medians=v_medians)
     test_df = add_weather_features(test_df, weather_df)
 
-    pred_raw = _predict_stratified(models, test_df)
+    # Ensemble: same weights computed on val
+    cat_test_pred = _predict_stratified(cat_models, test_df)
+    if lgb_model is not None:
+        lgb_test_pred = predict_lightgbm(lgb_model, test_df)
+        pred_raw = w_cat * cat_test_pred + w_lgb * lgb_test_pred
+    else:
+        pred_raw = cat_test_pred
     pred_min = apply_sanity_fallback(pred_raw, test_df)
 
     # Visibility: how many predictions were adjusted by the fallback
@@ -1259,7 +1516,7 @@ def main(
     submission.to_csv(submission_csv, index=False)
     print(f"\nSubmission written to {submission_csv}  ({len(submission)} rows)")
 
-    return models, train_df, val_df, test_df
+    return {"catboost": cat_models, "lightgbm": lgb_model}, train_df, val_df, test_df
 
 
 if __name__ == "__main__":

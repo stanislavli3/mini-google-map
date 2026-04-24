@@ -21,6 +21,65 @@ import numpy as np
 import pandas as pd
 
 
+# ---------------------------------------------------------------------------
+# pandas 3 compatibility shim for meteostat
+# ---------------------------------------------------------------------------
+# meteostat 1.6.8's Hourly/Daily/Monthly classes call pd.read_csv with
+# parse_dates={"time": [0, 1]} — a pandas 2 feature for combining multiple
+# columns into a single datetime. pandas 3 rejects that form:
+#   TypeError: Only booleans and lists are accepted for the 'parse_dates' parameter
+# We patch pd.read_csv once at import so meteostat's calls succeed.
+_ORIGINAL_READ_CSV = pd.read_csv
+
+
+def _read_csv_pd3_compat(*args, **kwargs):
+    parse_dates = kwargs.get("parse_dates")
+    if isinstance(parse_dates, dict):
+        combine_spec = dict(parse_dates)
+        kwargs["parse_dates"] = False
+        df = _ORIGINAL_READ_CSV(*args, **kwargs)
+        for new_col, cols in combine_spec.items():
+            # cols can be positional indices (the meteostat case) or names
+            if all(isinstance(c, int) for c in cols):
+                src_names = [df.columns[i] for i in cols]
+            else:
+                src_names = list(cols)
+            combined = df[src_names].astype(str).agg(" ".join, axis=1)
+            df[new_col] = pd.to_datetime(combined, errors="coerce")
+            df = df.drop(columns=src_names)
+        # Reorder so the new datetime column(s) come first — matches the
+        # positional semantics downstream meteostat code relies on.
+        first = [k for k in combine_spec]
+        others = [c for c in df.columns if c not in first]
+        df = df[first + others]
+        return df
+    return _ORIGINAL_READ_CSV(*args, **kwargs)
+
+
+pd.read_csv = _read_csv_pd3_compat
+
+
+# pandas 3 renamed frequency strings: "H" → "h" (hourly), "T" → "min", etc.
+# meteostat 1.6.8 uses the old uppercase aliases. We fix them by mutating
+# the class attribute before any instance is created.
+def _apply_meteostat_freq_patch():
+    try:
+        from meteostat.interface.hourly import Hourly
+        if getattr(Hourly, "_freq", None) == "1H":
+            Hourly._freq = "1h"
+    except Exception:
+        pass
+    try:
+        from meteostat.interface.daily import Daily
+        if getattr(Daily, "_freq", None) == "1D":
+            Daily._freq = "1D"  # pandas 3 still accepts "1D"; no-op
+    except Exception:
+        pass
+
+
+_apply_meteostat_freq_patch()
+
+
 SF_LAT = 37.7749
 SF_LON = -122.4194
 CACHE_PATH_DEFAULT = "sf_weather.pkl"
@@ -60,8 +119,13 @@ def load_sf_weather(
     # meteostat returns a tz-naive DatetimeIndex in UTC — make it explicit
     data.index = data.index.tz_localize("UTC") if data.index.tz is None else data.index
 
+    # pandas 3's .astype('int64') on DatetimeIndex now returns microseconds,
+    # not nanoseconds, so the `// 10**9` pattern gives wrong unix seconds.
+    # Convert to naive UTC then cast to second-resolution datetime64.
+    naive_utc = data.index.tz_convert("UTC").tz_localize(None)
+    ts_sec = naive_utc.astype("datetime64[s]").astype("int64")
     df = pd.DataFrame({
-        "timestamp_hour": (data.index.astype("int64") // 10**9).astype("int64"),
+        "timestamp_hour": ts_sec,
         "temp_c": data["temp"].values,
         "precip_mm": data["prcp"].fillna(0.0).values,
         "wind_kph": data["wspd"].values,
