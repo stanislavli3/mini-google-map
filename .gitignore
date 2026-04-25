@@ -108,3 +108,11 @@ catboost_info/
 credentials.json
 # Diagnostic only — never commit
 test_ground_truth.csv
+
+# =========================================
+# Working notes & generated docs
+# (kept on disk locally; not pushed to the repo)
+# =========================================
+PRESENTATION.md
+SUBMIT_NEXT.md
+*.zip

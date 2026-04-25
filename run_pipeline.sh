@@ -25,27 +25,34 @@ finish() {
 START_TS=$(date +%s)
 
 stage "1/8  Build sf_road_network.graphml (no-op if exists)"
-"$PY" build_graphml.py
+"$PY" src/stage1_graph/build_graphml.py
 
 stage "2/8  Baseline metrics on 20 trajectory files"
-"$PY" baseline_metrics.py --files 20 --out baseline_metrics.txt
+"$PY" src/stage2_matching/baseline_metrics.py --files 20 --out baseline_metrics.txt
 
 stage "3/8  Calibrate sigma_z and beta on 50 files"
-"$PY" calibrate_params.py --files 50
+"$PY" src/stage2_matching/calibrate_params.py --files 50
 
 stage "4/8  Stage 2 Phase A+B  (map matching → complete_speeds.pkl)"
 # 4 workers, clear any stale per-file match cache so the calibrated
 # sigma_z / beta actually take effect.
-"$PY" run_stage2_full.py --workers 4 --clear-match-cache
+"$PY" src/stage2_matching/run_stage2_full.py --workers 4 --clear-match-cache
 
 stage "5/8  Process test cases  (→ vehicle_features.pkl)"
-"$PY" process_test_cases.py
+"$PY" src/stage2_matching/process_test_cases.py
 
 stage "6/8  Stage 3 quick_diagnostics (smoke test)"
-"$PY" -c "from stage3_eta_prediction import quick_diagnostics; quick_diagnostics()"
+"$PY" -c "
+import sys, os
+sys.path.insert(0, 'src/stage3_eta')
+sys.path.insert(0, 'src')
+import _path_bootstrap  # noqa
+from stage3_eta_prediction import quick_diagnostics
+quick_diagnostics()
+"
 
 stage "7/8  Stage 3 full training + test prediction"
-"$PY" stage3_eta_prediction.py
+"$PY" src/stage3_eta/stage3_eta_prediction.py
 
 stage "8/8  Verify submission.csv"
 if [ ! -f submission.csv ]; then

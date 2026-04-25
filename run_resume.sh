@@ -25,13 +25,19 @@ for f in complete_speeds.pkl sf_road_network.graphml; do
 done
 
 stage "5/8  Process test cases  (→ vehicle_features.pkl)  [MAX_POINTS=400]"
-"$PY" process_test_cases.py
+"$PY" src/stage2_matching/process_test_cases.py
 
 stage "6/8  Stage 3 quick_diagnostics (smoke test)"
-"$PY" -c "from stage3_eta_prediction import quick_diagnostics; quick_diagnostics()"
+"$PY" -c "
+import sys
+sys.path.insert(0, 'src/stage3_eta'); sys.path.insert(0, 'src')
+import _path_bootstrap  # noqa
+from stage3_eta_prediction import quick_diagnostics
+quick_diagnostics()
+"
 
 stage "7/8  Stage 3 full training + test prediction"
-"$PY" stage3_eta_prediction.py
+"$PY" src/stage3_eta/stage3_eta_prediction.py
 
 stage "8/8  Verify submission.csv"
 if [ ! -f submission.csv ]; then

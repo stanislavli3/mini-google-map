@@ -466,32 +466,38 @@ nohup caffeinate -i bash run_pipeline.sh > pipeline.log 2>&1 &
 tail -f pipeline.log
 ```
 
-Stages executed by `run_pipeline.sh`:
+Stages executed by `run_pipeline.sh` (paths shown relative to repo root):
 
-1. `build_graphml.py` — downloads SF road network (skipped if file exists)
-2. `baseline_metrics.py --files 20` — reference measurements
-3. `calibrate_params.py --files 50` — writes `matching_params.pkl`
-4. `run_stage2_full.py --workers 4 --clear-match-cache` — Phase A (map matching) + Phase B (propagation) → `complete_speeds.pkl`
-5. `process_test_cases.py` — writes `vehicle_features.pkl` and merges Test-Cases observations into `complete_speeds.pkl`
+1. `src/stage1_graph/build_graphml.py` — downloads SF road network (skipped if file exists)
+2. `src/stage2_matching/baseline_metrics.py --files 20` — reference measurements
+3. `src/stage2_matching/calibrate_params.py --files 50` — writes `matching_params.pkl`
+4. `src/stage2_matching/run_stage2_full.py --workers 4 --clear-match-cache` — Phase A (map matching) + Phase B (propagation) → `complete_speeds.pkl`
+5. `src/stage2_matching/process_test_cases.py` — writes `vehicle_features.pkl` and merges Test-Cases observations into `complete_speeds.pkl`
 6. `quick_diagnostics()` — Stage 3 feature-matrix smoke test with assertions
-7. `stage3_eta_prediction.py` — Stage 3 full training + test prediction → `submission.csv`
+7. `src/stage3_eta/stage3_eta_prediction.py` — Stage 3 full training + test prediction → `submission.csv`
 8. Submission verification (row count + schema)
 
 ### Running stages individually
 
 ```bash
 # Rebuild just the road network
-python build_graphml.py --force
+python src/stage1_graph/build_graphml.py --force
 
 # Re-calibrate parameters from a different sample size
-python calibrate_params.py --files 100
+python src/stage2_matching/calibrate_params.py --files 100
 
 # Re-run Stage 2 with 8 workers on a cached Phase A
-python run_stage2_full.py --workers 8              # reuses matched_cache/
-python run_stage2_full.py --workers 8 --clear-match-cache  # forces re-match
+python src/stage2_matching/run_stage2_full.py --workers 8                   # reuses matched_cache/
+python src/stage2_matching/run_stage2_full.py --workers 8 --clear-match-cache   # forces re-match
 
 # Re-run Stage 3 against a locked complete_speeds.pkl
-python stage3_eta_prediction.py
+python src/stage3_eta/stage3_eta_prediction.py
+
+# Build a held-out val set for honest local iteration
+python src/utils/build_kaggle_like_val.py --per-vehicle 8 --out kaggle_like_val.csv
+
+# Standalone alternate predictor (no CatBoost, no physics ETA)
+python src/baselines/knn_predict.py --k 10 --hr-radius 2 --out submission_knn.csv
 ```
 
 ### Tuning notes
@@ -505,24 +511,56 @@ python stage3_eta_prediction.py
 
 ---
 
-## File reference
+## Repository layout
 
-| File | Status | Role |
-|---|---|---|
-| `stage3_eta_prediction.py` | **Modified** | Feature matrix, CatBoost training, submission writing |
-| `map_matching_fast.py` | **Modified** | HMM map matching (emission, transition, Viterbi), caches |
-| `map_matching_solution.py` | **Modified** | Graph loading, projection, original matcher, visualizer |
-| `run_stage2_full.py` | **Modified** | Phase A map matching + Phase B propagation |
-| `process_test_cases.py` | **Modified** | Test-case matching + per-vehicle feature extraction |
-| `requirements.txt` | **Modified** | Added `meteostat==1.6.8` |
-| `.gitignore` | **Modified** | Added caches and runtime artifacts |
-| `weather_features.py` | **New** | SF weather loader |
-| `build_graphml.py` | **New** | OSM network download |
-| `baseline_metrics.py` | **New** | Phase 0 reference metrics |
-| `calibrate_params.py` | **New** | HMM parameter calibration |
-| `run_pipeline.sh` | **New** | End-to-end orchestration |
+All Python source lives under `src/`, grouped by pipeline stage. Generated
+data, submissions, caches, and trajectory inputs are git-ignored — they
+live alongside the source on disk but never enter the repo.
 
-Generated artifacts (not committed, listed in `.gitignore`):
+```
+mini-google-map/
+├── README.md
+├── requirements.txt
+├── run_pipeline.sh                       # end-to-end orchestration (Stage 1→3)
+├── run_resume.sh                         # resume from Stage 5 (after Phase A+B)
+├── .gitignore
+└── src/
+    ├── _path_bootstrap.py                # makes every src/<subdir>/ importable as a flat namespace
+    │
+    ├── stage1_graph/
+    │   └── build_graphml.py              # `osmnx.graph_from_place(...)` → sf_road_network.graphml
+    │
+    ├── stage2_matching/                  # HMM map matching + speed aggregation
+    │   ├── map_matching_solution.py      # base HMM (emission, transition, Viterbi, projection)
+    │   ├── map_matching_fast.py          # faster matcher: bearing emission, adaptive radius, path-break detection, sibling-import contract
+    │   ├── calibrate_params.py           # MAD-based σ_z + mean β estimation → matching_params.pkl
+    │   ├── baseline_metrics.py           # Phase 0 — wall-clock + coverage on a sample
+    │   ├── run_stage2_full.py            # Phase A (match) + Phase B (propagate) → complete_speeds.pkl
+    │   └── process_test_cases.py         # match Test Cases trajectories, build vehicle_features.pkl
+    │
+    ├── stage3_eta/                       # Feature matrix + CatBoost/LightGBM
+    │   ├── stage3_eta_prediction.py      # ETA model: 48-feature matrix, residual target, ensemble, sanity fallback → submission.csv
+    │   ├── weather_features.py           # Meteostat hourly SF weather loader → sf_weather.pkl
+    │   └── enhance_vehicle_features.py   # appends per-hour median-speed columns to vehicle_features.pkl
+    │
+    ├── utils/                            # eval + post-processing
+    │   ├── build_kaggle_like_val.py      # synthesize a held-out val set in Kaggle test schema
+    │   └── calibrate_submission.py       # quantile-match a submission to a target distribution
+    │
+    └── baselines/                        # alternate, completely-different predictors
+        └── knn_predict.py                # per-vehicle k-NN over historical trip patterns
+```
+
+### Cross-subdir imports
+
+Every file in `src/<subdir>/` starts with a small bootstrap snippet that
+adds *all* `src/<subdir>/` directories to `sys.path` and exposes
+`PROJECT_ROOT`. Entry-point scripts then `os.chdir(PROJECT_ROOT)` in
+their `__main__` block, so the relative paths in the code (e.g.
+`'sf_road_network.graphml'`, `'Trajectories'`) resolve consistently no
+matter where the script was invoked from.
+
+### Generated artifacts (git-ignored)
 
 | Artifact | Producer | Consumer |
 |---|---|---|
@@ -534,7 +572,8 @@ Generated artifacts (not committed, listed in `.gitignore`):
 | `vehicle_features.pkl` | `process_test_cases.py` | Stage 3 |
 | `sf_weather.pkl` | `weather_features.py` | Stage 3 |
 | `baseline_metrics.txt` | `baseline_metrics.py` | Humans |
-| `submission.csv` | `stage3_eta_prediction.py` | Kaggle |
+| `kaggle_like_val.csv` | `build_kaggle_like_val.py` | Stage 3 (val set) |
+| `submission*.csv` | `stage3_eta_prediction.py` + variants | Kaggle |
 
 ---
 
