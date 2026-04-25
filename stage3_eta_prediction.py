@@ -1031,34 +1031,35 @@ def train_catboost(
 def apply_sanity_fallback(pred_min, df: pd.DataFrame) -> np.ndarray:
     """
     Protect against model blow-outs by enforcing distance-based bounds and
-    blending wildly off predictions toward the physics ETA.
+    blending wildly *small* predictions toward the physics ETA.
 
-    - Hard floor: route_length at 40 m/s (~144 km/h, absolute ceiling speed)
-    - Hard ceiling: route_length at 2.5 m/s (~9 km/h, gridlock crawl)
-    - Soft blend toward physics_eta when |pred / physics| is outside [1/3, 3]
-
-    The physics ETA is conservative — higher RMSE than the model on average
-    — but never absurd, which makes it the right fallback for tail cases.
+    LB-feedback tuning (2026-04-25): the previous version blended on BOTH
+    sides of `pred / physics ∈ [1/3, 3]` and used a 2.5 m/s gridlock-crawl
+    ceiling. With LB direction confirming systematic *under*-prediction,
+    we (a) drop the upper-side blend that was pulling long predictions
+    down toward conservative physics ETAs, (b) drop the ceiling speed to
+    0.7 m/s (~2.5 km/h, plausible SF traffic-light crawl), and (c) keep
+    the floor and the lower-side blend (those still protect against
+    obviously-too-fast predictions).
     """
     pred = np.asarray(pred_min, dtype=float).copy()
     physics = df["physics_eta_min"].values
     route_km = np.asarray(df["route_length_km"].values, dtype=float)
     haversine = np.asarray(df["haversine_km"].values, dtype=float)
 
-    # Use max(route, haversine) so a broken physics route (route_km ≈ 0)
-    # doesn't floor the prediction at 0 minutes.
     length_km = np.maximum(route_km, haversine).clip(min=0.05)
-    t_floor = length_km * 1000.0 / 40.0 / 60.0
-    t_ceil = length_km * 1000.0 / 2.5 / 60.0
+    t_floor = length_km * 1000.0 / 40.0 / 60.0   # 40 m/s upper speed bound
+    t_ceil = length_km * 1000.0 / 0.7 / 60.0     # 0.7 m/s lower speed bound
     pred = np.clip(pred, t_floor, t_ceil)
 
     safe_physics = np.clip(physics, 0.5, 120.0)
     with np.errstate(divide="ignore", invalid="ignore"):
         ratio = pred / safe_physics
-    extreme = (ratio < 1.0 / 3.0) | (ratio > 3.0) | ~np.isfinite(ratio)
-    pred = np.where(extreme, 0.4 * pred + 0.6 * safe_physics, pred)
+    # Lower-side blend ONLY (don't pull big predictions down).
+    too_low = (ratio < 1.0 / 3.0) | ~np.isfinite(ratio)
+    pred = np.where(too_low, 0.4 * pred + 0.6 * safe_physics, pred)
 
-    return np.clip(pred, 0.5, 120.0)
+    return np.clip(pred, 0.5, 240.0)
 
 
 def _train_stratified(train_df: pd.DataFrame,

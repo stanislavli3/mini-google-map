@@ -36,9 +36,12 @@ from map_matching_solution import load_trajectory, great_circle_distance
 def _select_interior_pair(
     traj,
     min_gap_s: int = 60,
-    max_gap_s: int = 30 * 60,   # 30 min window — matches realistic SF taxi trips;
-                                 # test haversine distances cap ~10km so 30 min
-                                 # bounds the physically plausible durations
+    max_gap_s: int = 120 * 60,  # 120-min window. The 30-min cap was wrong:
+                                 # LB feedback showed test trips have a heavy
+                                 # tail (real taxi trips with traffic / waits
+                                 # can run 60+ min on small haversine), and
+                                 # the cap was making early-stopping pick a
+                                 # model that ignored that tail.
     rng: random.Random = None,
 ) -> Tuple[int, int]:
     """

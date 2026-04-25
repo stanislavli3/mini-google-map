@@ -106,3 +106,5 @@ catboost_info/
 .env
 *.key
 credentials.json
+# Diagnostic only — never commit
+test_ground_truth.csv
